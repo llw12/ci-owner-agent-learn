@@ -114,9 +114,7 @@ class InvestigationResult(DomainModel):
 class ValidationResult(DomainModel):
     error_id: str
     verdict: ValidationVerdict
-    original_confidence: Confidence
     final_confidence: Confidence
-    owner_candidate: OwnerCandidate | None = None
     root_cause_valid: bool
     ownership_valid: bool
     confidence_valid: bool
@@ -124,20 +122,6 @@ class ValidationResult(DomainModel):
     rejected_evidence_ids: list[str] = Field(default_factory=list)
     validation_reasons: list[str] = Field(default_factory=list)
     needs_reinvestigation: bool = False
-
-    @model_validator(mode="after")
-    def final_confidence_cannot_exceed_original(self) -> Self:
-        confidence_order = (
-            Confidence.NONE,
-            Confidence.LOW,
-            Confidence.MEDIUM,
-            Confidence.HIGH,
-        )
-        if confidence_order.index(self.final_confidence) > confidence_order.index(
-            self.original_confidence
-        ):
-            raise ValueError("final_confidence cannot exceed original_confidence")
-        return self
 
 
 class FinalError(DomainModel):
@@ -164,3 +148,27 @@ class AnalysisState(DomainModel):
     validations: dict[str, ValidationResult] = Field(default_factory=dict)
     final_report: FinalReport | None = None
     fatal_error: str | None = None
+
+    @model_validator(mode="after")
+    def validations_cannot_override_investigations(self) -> Self:
+        confidence_order = (
+            Confidence.NONE,
+            Confidence.LOW,
+            Confidence.MEDIUM,
+            Confidence.HIGH,
+        )
+        for validation in self.validations.values():
+            investigation = self.investigations.get(validation.error_id)
+            if investigation is None:
+                raise ValueError(
+                    f"validation for {validation.error_id!r} requires a matching "
+                    "investigation"
+                )
+            if confidence_order.index(
+                validation.final_confidence
+            ) > confidence_order.index(investigation.confidence):
+                raise ValueError(
+                    "validation final_confidence cannot exceed investigation "
+                    f"confidence for {validation.error_id!r}"
+                )
+        return self

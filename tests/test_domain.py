@@ -56,29 +56,96 @@ def test_error_candidate_forbids_investigation_fields() -> None:
 def test_validation_result_allows_confidence_to_stay_or_decrease(
     original: Confidence, final: Confidence
 ) -> None:
-    result = ValidationResult(
+    investigation = InvestigationResult(
+        error_id="error-1",
+        hypothesis="The identifier generator changed",
+        confidence=original,
+    )
+    validation = ValidationResult(
         error_id="error-1",
         verdict=ValidationVerdict.DOWNGRADED,
-        original_confidence=original,
         final_confidence=final,
         root_cause_valid=False,
         ownership_valid=False,
         confidence_valid=True,
     )
+    state = AnalysisState(
+        build=BuildContext(
+            build_id="build-1", job_name="unit-tests", log_ref="log://build-1"
+        ),
+        investigations={"error-1": investigation},
+        validations={"error-1": validation},
+    )
 
-    assert result.final_confidence is final
+    assert state.validations["error-1"].final_confidence is final
 
 
-def test_validation_result_rejects_confidence_upgrade() -> None:
+def test_analysis_state_rejects_validation_confidence_upgrade() -> None:
+    investigation = InvestigationResult(
+        error_id="error-1",
+        hypothesis="The identifier generator changed",
+        confidence=Confidence.LOW,
+    )
+    validation = ValidationResult(
+        error_id="error-1",
+        verdict=ValidationVerdict.ACCEPTED,
+        final_confidence=Confidence.HIGH,
+        root_cause_valid=True,
+        ownership_valid=True,
+        confidence_valid=True,
+    )
+
     with pytest.raises(ValidationError, match="cannot exceed"):
+        AnalysisState(
+            build=BuildContext(
+                build_id="build-1", job_name="unit-tests", log_ref="log://build-1"
+            ),
+            investigations={"error-1": investigation},
+            validations={"error-1": validation},
+        )
+
+
+def test_analysis_state_rejects_validation_without_investigation() -> None:
+    validation = ValidationResult(
+        error_id="error-1",
+        verdict=ValidationVerdict.REJECTED,
+        final_confidence=Confidence.NONE,
+        root_cause_valid=False,
+        ownership_valid=False,
+        confidence_valid=False,
+    )
+
+    with pytest.raises(ValidationError, match="requires a matching investigation"):
+        AnalysisState(
+            build=BuildContext(
+                build_id="build-1", job_name="unit-tests", log_ref="log://build-1"
+            ),
+            validations={"error-1": validation},
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("original_confidence", Confidence.LOW),
+        (
+            "owner_candidate",
+            OwnerCandidate(identity="alice", reason="Changed the affected code"),
+        ),
+    ],
+)
+def test_validation_result_forbids_investigator_owned_fields(
+    field: str, value: object
+) -> None:
+    with pytest.raises(ValidationError, match=field):
         ValidationResult(
             error_id="error-1",
             verdict=ValidationVerdict.ACCEPTED,
-            original_confidence=Confidence.LOW,
-            final_confidence=Confidence.HIGH,
+            final_confidence=Confidence.LOW,
             root_cause_valid=True,
             ownership_valid=True,
             confidence_valid=True,
+            **{field: value},
         )
 
 
@@ -130,9 +197,7 @@ def test_analysis_state_serializes_as_stable_structured_data() -> None:
     validation = ValidationResult(
         error_id="error-1",
         verdict=ValidationVerdict.ACCEPTED,
-        original_confidence=Confidence.HIGH,
         final_confidence=Confidence.HIGH,
-        owner_candidate=owner,
         root_cause_valid=True,
         ownership_valid=True,
         confidence_valid=True,
