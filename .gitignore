@@ -3,3 +3,5 @@
 __pycache__/
 *.py[cod]
 .idea/
+eval_data/
+traces/
