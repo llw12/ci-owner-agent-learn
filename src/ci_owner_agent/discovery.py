@@ -68,7 +68,7 @@ class JsonTransport(Protocol):
         headers: dict[str, str],
         payload: dict[str, object],
         timeout: float,
-    ) -> dict[str, object]: ...
+    ) -> object: ...
 
 
 class UrllibJsonTransport:
@@ -78,7 +78,7 @@ class UrllibJsonTransport:
         headers: dict[str, str],
         payload: dict[str, object],
         timeout: float,
-    ) -> dict[str, object]:
+    ) -> object:
         request = Request(
             url,
             data=json.dumps(payload).encode("utf-8"),
@@ -86,14 +86,24 @@ class UrllibJsonTransport:
             method="POST",
         )
         with urlopen(request, timeout=timeout) as response:
-            result = json.loads(response.read().decode("utf-8"))
-        if not isinstance(result, dict):
-            raise TypeError("provider response must be a JSON object")
-        return result
+            return json.loads(response.read().decode("utf-8"))
 
 
 class DiscoveryModelError(Exception):
     """Raised when an external discovery model request or response fails."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: str,
+        metadata: dict[str, object] | None = None,
+        raw_content: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.metadata = dict(metadata or {})
+        self.raw_content = raw_content
 
 
 class OpenAICompatibleDiscoveryModel:
@@ -114,6 +124,16 @@ class OpenAICompatibleDiscoveryModel:
         self.transport = transport or UrllibJsonTransport()
         self.last_metadata: dict[str, object] = {}
 
+    @staticmethod
+    def _request_metadata(
+        started: float,
+        metadata: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        return {
+            **(metadata or {}),
+            "latency_ms": round((perf_counter() - started) * 1000, 3),
+        }
+
     @classmethod
     def from_env(cls) -> "OpenAICompatibleDiscoveryModel":
         names = {
@@ -125,7 +145,8 @@ class OpenAICompatibleDiscoveryModel:
         missing = [names[key] for key, value in values.items() if not value]
         if missing:
             raise DiscoveryModelError(
-                "missing model configuration: " + ", ".join(missing)
+                "missing model configuration: " + ", ".join(missing),
+                reason="configuration_error",
             )
         return cls(
             base_url=str(values["base_url"]),
@@ -134,6 +155,7 @@ class OpenAICompatibleDiscoveryModel:
         )
 
     def extract_errors(self, chunk: LogChunk) -> ChunkDiscovery:
+        self.last_metadata = {}
         schema = json.dumps(
             ChunkDiscovery.model_json_schema(), ensure_ascii=False
         )
@@ -160,6 +182,33 @@ class OpenAICompatibleDiscoveryModel:
                 payload,
                 self.timeout,
             )
+        except json.JSONDecodeError as error:
+            self.last_metadata = self._request_metadata(started)
+            raise DiscoveryModelError(
+                f"model {self.model_name!r} returned an invalid provider response",
+                reason="invalid_provider_response",
+                metadata=self.last_metadata,
+            ) from error
+        except Exception as error:
+            self.last_metadata = self._request_metadata(started)
+            raise DiscoveryModelError(
+                f"model {self.model_name!r} request failed",
+                reason="transport_error",
+                metadata=self.last_metadata,
+            ) from error
+
+        response_metadata: dict[str, object] = {}
+        try:
+            if not isinstance(response, dict):
+                raise TypeError("provider response must be a JSON object")
+            usage = response.get("usage")
+            if isinstance(usage, dict):
+                prompt_tokens = usage.get("prompt_tokens")
+                completion_tokens = usage.get("completion_tokens")
+                if isinstance(prompt_tokens, int):
+                    response_metadata["input_tokens"] = prompt_tokens
+                if isinstance(completion_tokens, int):
+                    response_metadata["output_tokens"] = completion_tokens
             choices = response["choices"]
             if not isinstance(choices, list) or not choices:
                 raise TypeError("provider response has no choices")
@@ -172,24 +221,38 @@ class OpenAICompatibleDiscoveryModel:
             content = message["content"]
             if not isinstance(content, str):
                 raise TypeError("provider message content must be text")
-            result = ChunkDiscovery.model_validate_json(content)
-        except Exception as error:
+        except (KeyError, TypeError) as error:
+            self.last_metadata = self._request_metadata(
+                started, response_metadata
+            )
             raise DiscoveryModelError(
-                f"model {self.model_name!r} returned an invalid response"
+                f"model {self.model_name!r} returned an invalid provider response",
+                reason="invalid_provider_response",
+                metadata=self.last_metadata,
             ) from error
-        finally:
-            self.last_metadata = {
-                "latency_ms": round((perf_counter() - started) * 1000, 3)
-            }
 
-        usage = response.get("usage")
-        if isinstance(usage, dict):
-            prompt_tokens = usage.get("prompt_tokens")
-            completion_tokens = usage.get("completion_tokens")
-            if isinstance(prompt_tokens, int):
-                self.last_metadata["input_tokens"] = prompt_tokens
-            if isinstance(completion_tokens, int):
-                self.last_metadata["output_tokens"] = completion_tokens
+        try:
+            result = ChunkDiscovery.model_validate_json(content)
+        except ValidationError as error:
+            self.last_metadata = self._request_metadata(
+                started,
+                {
+                    **response_metadata,
+                    "content_sha256": sha256(
+                        content.encode("utf-8")
+                    ).hexdigest(),
+                    "content_length": len(content),
+                    "validation_error_count": error.error_count(),
+                },
+            )
+            raise DiscoveryModelError(
+                f"model {self.model_name!r} returned invalid structured output",
+                reason="invalid_structured_output",
+                metadata=self.last_metadata,
+                raw_content=content,
+            ) from error
+
+        self.last_metadata = self._request_metadata(started, response_metadata)
         return result
 
 
@@ -418,7 +481,27 @@ class LLMDiscoverer:
                     data=request_data,
                 )
             )
-            raw_result = self.model.extract_errors(chunk)
+            try:
+                raw_result = self.model.extract_errors(chunk)
+            except DiscoveryModelError as error:
+                failure_data = {
+                    **error.metadata,
+                    "reason": error.reason,
+                    "model": self.model.model_name,
+                    "prompt_version": DISCOVERY_PROMPT_VERSION,
+                }
+                if self.capture_content and error.raw_content is not None:
+                    failure_data["raw_content"] = error.raw_content
+                self._emit(
+                    TraceEvent(
+                        run_id=run_id,
+                        event_type="llm_failed",
+                        build_id=build.build_id,
+                        chunk_id=chunk.chunk_id,
+                        data=failure_data,
+                    )
+                )
+                raise
             result_data = (
                 raw_result.model_dump()
                 if isinstance(raw_result, BaseModel)

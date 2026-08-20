@@ -1,3 +1,5 @@
+from hashlib import sha256
+import json
 from pathlib import Path
 
 import pytest
@@ -65,7 +67,7 @@ class FailingTraceSink:
 
 
 class FakeJsonTransport:
-    def __init__(self, response: dict[str, object]) -> None:
+    def __init__(self, response: object) -> None:
         self.response = response
         self.requests: list[dict[str, object]] = []
 
@@ -75,7 +77,7 @@ class FakeJsonTransport:
         headers: dict[str, str],
         payload: dict[str, object],
         timeout: float,
-    ) -> dict[str, object]:
+    ) -> object:
         self.requests.append(
             {
                 "url": url,
@@ -85,6 +87,28 @@ class FakeJsonTransport:
             }
         )
         return self.response
+
+
+class FailingJsonTransport:
+    def post_json(
+        self,
+        url: str,
+        headers: dict[str, str],
+        payload: dict[str, object],
+        timeout: float,
+    ) -> object:
+        raise OSError("network down")
+
+
+class InvalidJsonTransport:
+    def post_json(
+        self,
+        url: str,
+        headers: dict[str, str],
+        payload: dict[str, object],
+        timeout: float,
+    ) -> object:
+        raise json.JSONDecodeError("invalid provider JSON", "not-json", 0)
 
 
 class FixedInvestigator:
@@ -503,12 +527,14 @@ def test_openai_compatible_model_sends_prompt_and_parses_structured_result() -> 
     assert model.last_metadata["output_tokens"] == 25
 
 
-def test_openai_compatible_model_rejects_invalid_provider_json() -> None:
+def test_openai_compatible_model_classifies_invalid_structured_output() -> None:
+    raw_content = '{"errors":[{"title":"bad"}]}'
     transport = FakeJsonTransport(
         {
             "choices": [
-                {"message": {"content": '{"errors":[{"title":"bad"}]}'}}
-            ]
+                {"message": {"content": raw_content}}
+            ],
+            "usage": {"prompt_tokens": 41, "completion_tokens": 7},
         }
     )
     model = OpenAICompatibleDiscoveryModel(
@@ -518,7 +544,7 @@ def test_openai_compatible_model_rejects_invalid_provider_json() -> None:
         transport=transport,
     )
 
-    with pytest.raises(DiscoveryModelError, match="invalid response"):
+    with pytest.raises(DiscoveryModelError) as raised:
         model.extract_errors(
             LogChunk(
                 chunk_id="chunk-0001",
@@ -527,6 +553,203 @@ def test_openai_compatible_model_rejects_invalid_provider_json() -> None:
                 text="[1] failure",
             )
         )
+
+    assert raised.value.reason == "invalid_structured_output"
+    assert raised.value.metadata["content_sha256"] == sha256(
+        raw_content.encode("utf-8")
+    ).hexdigest()
+    assert raised.value.metadata["content_length"] == len(raw_content)
+    assert raised.value.metadata["validation_error_count"] == 3
+    assert raised.value.metadata["input_tokens"] == 41
+    assert raised.value.metadata["output_tokens"] == 7
+
+
+def test_openai_compatible_model_classifies_transport_error() -> None:
+    model = OpenAICompatibleDiscoveryModel(
+        base_url="https://llm.example/v1",
+        api_key="test-key",
+        model="test-model",
+        transport=FailingJsonTransport(),
+    )
+
+    with pytest.raises(DiscoveryModelError) as raised:
+        model.extract_errors(
+            LogChunk(
+                chunk_id="chunk-0001",
+                start_line=1,
+                end_line=1,
+                text="[1] failure",
+            )
+        )
+
+    assert raised.value.reason == "transport_error"
+    assert isinstance(raised.value.__cause__, OSError)
+    assert str(raised.value.__cause__) == "network down"
+
+
+def test_openai_compatible_model_classifies_invalid_provider_response() -> None:
+    model = OpenAICompatibleDiscoveryModel(
+        base_url="https://llm.example/v1",
+        api_key="test-key",
+        model="test-model",
+        transport=FakeJsonTransport({"choices": []}),
+    )
+
+    with pytest.raises(DiscoveryModelError) as raised:
+        model.extract_errors(
+            LogChunk(
+                chunk_id="chunk-0001",
+                start_line=1,
+                end_line=1,
+                text="[1] failure",
+            )
+        )
+
+    assert raised.value.reason == "invalid_provider_response"
+    assert raised.value.reason != "transport_error"
+
+
+def test_openai_compatible_model_classifies_non_object_provider_response() -> None:
+    model = OpenAICompatibleDiscoveryModel(
+        base_url="https://llm.example/v1",
+        api_key="test-key",
+        model="test-model",
+        transport=FakeJsonTransport([]),
+    )
+
+    with pytest.raises(DiscoveryModelError) as raised:
+        model.extract_errors(
+            LogChunk(
+                chunk_id="chunk-0001",
+                start_line=1,
+                end_line=1,
+                text="[1] failure",
+            )
+        )
+
+    assert raised.value.reason == "invalid_provider_response"
+
+
+def test_openai_compatible_model_classifies_undecodable_provider_response() -> None:
+    model = OpenAICompatibleDiscoveryModel(
+        base_url="https://llm.example/v1",
+        api_key="test-key",
+        model="test-model",
+        transport=InvalidJsonTransport(),
+    )
+
+    with pytest.raises(DiscoveryModelError) as raised:
+        model.extract_errors(
+            LogChunk(
+                chunk_id="chunk-0001",
+                start_line=1,
+                end_line=1,
+                text="[1] failure",
+            )
+        )
+
+    assert raised.value.reason == "invalid_provider_response"
+
+
+def test_model_metadata_does_not_reuse_tokens_after_failure() -> None:
+    transport = FakeJsonTransport(
+        {
+            "choices": [{"message": {"content": '{"errors":[]}'}}],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 25},
+        }
+    )
+    model = OpenAICompatibleDiscoveryModel(
+        base_url="https://llm.example/v1",
+        api_key="test-key",
+        model="test-model",
+        transport=transport,
+    )
+    chunk = LogChunk(
+        chunk_id="chunk-0001",
+        start_line=1,
+        end_line=1,
+        text="[1] failure",
+    )
+
+    model.extract_errors(chunk)
+    assert model.last_metadata["input_tokens"] == 100
+    transport.response = {"choices": []}
+
+    with pytest.raises(DiscoveryModelError) as raised:
+        model.extract_errors(chunk)
+
+    assert "input_tokens" not in model.last_metadata
+    assert "output_tokens" not in model.last_metadata
+    assert "input_tokens" not in raised.value.metadata
+    assert "output_tokens" not in raised.value.metadata
+
+
+def test_real_adapter_structured_failure_is_traced_without_raw_content(
+    tmp_path: Path,
+) -> None:
+    raw_content = '{"errors":[{"title":"secret-model-output"}]}'
+    model = OpenAICompatibleDiscoveryModel(
+        base_url="https://llm.example/v1",
+        api_key="test-key",
+        model="test-model",
+        transport=FakeJsonTransport(
+            {"choices": [{"message": {"content": raw_content}}]}
+        ),
+    )
+    trace = RecordingTraceSink()
+
+    with pytest.raises(DiscoveryModelError) as raised:
+        LLMDiscoverer(
+            LocalLogReader(),
+            model,
+            trace_sink=trace,
+        ).discover(make_build(write_log(tmp_path, "failure\n")))
+
+    assert raised.value.reason == "invalid_structured_output"
+    assert [event.event_type for event in trace.events][-3:] == [
+        "llm_request",
+        "llm_failed",
+        "discovery_failed",
+    ]
+    failure = next(event for event in trace.events if event.event_type == "llm_failed")
+    assert failure.data["reason"] == "invalid_structured_output"
+    assert failure.data["model"] == "test-model"
+    assert failure.data["prompt_version"] == "discover-v1"
+    assert failure.data["content_sha256"] == sha256(
+        raw_content.encode("utf-8")
+    ).hexdigest()
+    assert failure.data["content_length"] == len(raw_content)
+    assert failure.data["validation_error_count"] == 3
+    serialized_trace = "\n".join(
+        event.model_dump_json() for event in trace.events
+    )
+    assert "secret-model-output" not in serialized_trace
+
+
+def test_real_adapter_structured_failure_trace_captures_raw_content_when_enabled(
+    tmp_path: Path,
+) -> None:
+    raw_content = '{"errors":[{"title":"secret-model-output"}]}'
+    model = OpenAICompatibleDiscoveryModel(
+        base_url="https://llm.example/v1",
+        api_key="test-key",
+        model="test-model",
+        transport=FakeJsonTransport(
+            {"choices": [{"message": {"content": raw_content}}]}
+        ),
+    )
+    trace = RecordingTraceSink()
+
+    with pytest.raises(DiscoveryModelError):
+        LLMDiscoverer(
+            LocalLogReader(),
+            model,
+            trace_sink=trace,
+            capture_content=True,
+        ).discover(make_build(write_log(tmp_path, "failure\n")))
+
+    failure = next(event for event in trace.events if event.event_type == "llm_failed")
+    assert failure.data["raw_content"] == raw_content
 
 
 def test_llm_discoverer_satisfies_existing_orchestrator_contract(
