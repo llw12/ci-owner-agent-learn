@@ -56,6 +56,8 @@ DISCOVERY_SYSTEM_PROMPT = """你是 CI 日志错误发现器。
 
 对每个错误输出 title、category、primary_message、test_name、start_line、end_line。test_name 仅在日志明确存在时填写，否则为 null。category 只能描述日志表象类型，不确定时为 null。
 
+start_line 和 end_line 必须使用每行开头 [N] 中的日志绝对行号。例如 `[123] at foo.js:45` 的日志行号是 123，不是 45。禁止把源码行号、stack trace 中的数字或错误消息里的数字当作日志行号。
+
 不要仅因为出现 ERROR、failed、exception 等单词就认定构建失败；测试可能故意触发并成功验证异常。不要因为 message 相同就合并不同位置的失败。构建系统对同一测试失败的 process exit、make error、build failure 等包装不应机械地产生额外错误。
 
 如果当前片段没有值得独立调查的错误，返回空 errors。只返回符合给定 JSON schema 的 JSON，不要输出推理过程。"""
@@ -107,7 +109,11 @@ class DiscoveryModelError(Exception):
 
 
 class OpenAICompatibleDiscoveryModel:
-    """Call an OpenAI-compatible chat-completions JSON endpoint."""
+    """Call an OpenAI-compatible chat-completions JSON endpoint.
+
+    The default ``json_schema`` response format preserves LM Studio behavior.
+    Thinking is omitted unless explicitly set to ``disabled`` or ``enabled``.
+    """
 
     def __init__(
         self,
@@ -116,12 +122,24 @@ class OpenAICompatibleDiscoveryModel:
         model: str,
         timeout: float = 60.0,
         transport: JsonTransport | None = None,
+        response_format_mode: str = "json_schema",
+        thinking: str | None = None,
+        extra_body: dict[str, object] | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.model_name = model
         self.timeout = timeout
         self.transport = transport or UrllibJsonTransport()
+        if response_format_mode not in {"json_object", "json_schema"}:
+            raise ValueError(
+                "response_format_mode must be 'json_object' or 'json_schema'"
+            )
+        if thinking not in {None, "disabled", "enabled"}:
+            raise ValueError("thinking must be 'disabled', 'enabled', or None")
+        self.response_format_mode = response_format_mode
+        self.thinking = thinking
+        self.extra_body = dict(extra_body or {})
         self.last_metadata: dict[str, object] = {}
 
     @staticmethod
@@ -152,25 +170,46 @@ class OpenAICompatibleDiscoveryModel:
             base_url=str(values["base_url"]),
             api_key=str(values["api_key"]),
             model=str(values["model"]),
+            response_format_mode=os.getenv(
+                "CI_OWNER_LLM_RESPONSE_FORMAT", "json_schema"
+            ),
+            thinking=os.getenv("CI_OWNER_LLM_THINKING") or None,
         )
 
     def extract_errors(self, chunk: LogChunk) -> ChunkDiscovery:
         self.last_metadata = {}
-        schema = json.dumps(
-            ChunkDiscovery.model_json_schema(), ensure_ascii=False
-        )
+        schema = ChunkDiscovery.model_json_schema()
+        if self.response_format_mode == "json_schema":
+            response_format: dict[str, object] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "chunk_discovery",
+                    "strict": True,
+                    "schema": schema,
+                },
+            }
+            system_prompt = DISCOVERY_SYSTEM_PROMPT
+        else:
+            response_format = {"type": "json_object"}
+            system_prompt = (
+                f"{DISCOVERY_SYSTEM_PROMPT}\n\nJSON schema:\n"
+                f"{json.dumps(schema, ensure_ascii=False)}"
+            )
         payload: dict[str, object] = {
+            **self.extra_body,
             "model": self.model_name,
             "temperature": 0,
-            "response_format": {"type": "json_object"},
+            "response_format": response_format,
             "messages": [
                 {
                     "role": "system",
-                    "content": f"{DISCOVERY_SYSTEM_PROMPT}\n\nJSON schema:\n{schema}",
+                    "content": system_prompt,
                 },
                 {"role": "user", "content": chunk.text},
             ],
         }
+        if self.thinking is not None:
+            payload["thinking"] = {"type": self.thinking}
         started = perf_counter()
         try:
             response = self.transport.post_json(

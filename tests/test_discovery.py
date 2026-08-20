@@ -520,11 +520,132 @@ def test_openai_compatible_model_sends_prompt_and_parses_structured_result() -> 
     payload = request["payload"]
     assert isinstance(payload, dict)
     assert payload["model"] == "test-model"
-    assert payload["response_format"] == {"type": "json_object"}
+    assert payload["response_format"] == {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "chunk_discovery",
+            "strict": True,
+            "schema": ChunkDiscovery.model_json_schema(),
+        },
+    }
     assert "[12] AssertionError" in str(payload["messages"])
     assert "禁止判断根因" in str(payload["messages"])
+    assert "JSON schema:" not in str(payload["messages"])
+    assert "每行开头 [N]" in str(payload["messages"])
+    assert "[123] at foo.js:45" in str(payload["messages"])
+    assert "日志行号是 123，不是 45" in str(payload["messages"])
+    assert "源码行号" in str(payload["messages"])
+    assert "stack trace" in str(payload["messages"])
+    assert "错误消息里的数字" in str(payload["messages"])
     assert model.last_metadata["input_tokens"] == 100
     assert model.last_metadata["output_tokens"] == 25
+
+
+def test_openai_compatible_model_supports_json_object_mode() -> None:
+    transport = FakeJsonTransport(
+        {"choices": [{"message": {"content": '{"errors":[]}'}}]}
+    )
+    model = OpenAICompatibleDiscoveryModel(
+        base_url="https://api.deepseek.com",
+        api_key="test-key",
+        model="deepseek-chat",
+        response_format_mode="json_object",
+        transport=transport,
+    )
+
+    result = model.extract_errors(
+        LogChunk(
+            chunk_id="chunk-0001",
+            start_line=1,
+            end_line=1,
+            text="[1] success",
+        )
+    )
+
+    assert result == ChunkDiscovery(errors=[])
+    payload = transport.requests[0]["payload"]
+    assert isinstance(payload, dict)
+    assert payload["response_format"] == {"type": "json_object"}
+    assert "thinking" not in payload
+    messages = payload["messages"]
+    assert isinstance(messages, list)
+    system_prompt = messages[0]["content"]
+    assert "只返回符合给定 JSON schema 的 JSON" in system_prompt
+    assert "JSON schema:" in system_prompt
+    assert '"primary_message"' in system_prompt
+    assert '"start_line"' in system_prompt
+    assert '"end_line"' in system_prompt
+
+
+def test_openai_compatible_model_rejects_invalid_response_format_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CI_OWNER_LLM_BASE_URL", "https://llm.example/v1")
+    monkeypatch.setenv("CI_OWNER_LLM_API_KEY", "test-key")
+    monkeypatch.setenv("CI_OWNER_LLM_MODEL", "test-model")
+    monkeypatch.setenv("CI_OWNER_LLM_RESPONSE_FORMAT", "yaml")
+
+    with pytest.raises(ValueError, match="response_format_mode"):
+        OpenAICompatibleDiscoveryModel.from_env()
+
+
+def test_openai_compatible_model_adds_thinking_and_extra_request_body() -> None:
+    transport = FakeJsonTransport(
+        {"choices": [{"message": {"content": '{"errors":[]}'}}]}
+    )
+    model = OpenAICompatibleDiscoveryModel(
+        base_url="https://api.deepseek.com",
+        api_key="test-key",
+        model="deepseek-chat",
+        response_format_mode="json_object",
+        thinking="disabled",
+        extra_body={"max_tokens": 512},
+        transport=transport,
+    )
+
+    model.extract_errors(
+        LogChunk(
+            chunk_id="chunk-0001",
+            start_line=1,
+            end_line=1,
+            text="[1] success",
+        )
+    )
+
+    payload = transport.requests[0]["payload"]
+    assert isinstance(payload, dict)
+    assert payload["thinking"] == {"type": "disabled"}
+    assert payload["max_tokens"] == 512
+
+
+def test_openai_compatible_model_from_env_reads_provider_capabilities(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CI_OWNER_LLM_BASE_URL", "https://api.deepseek.com")
+    monkeypatch.setenv("CI_OWNER_LLM_API_KEY", "test-key")
+    monkeypatch.setenv("CI_OWNER_LLM_MODEL", "deepseek-chat")
+    monkeypatch.setenv("CI_OWNER_LLM_RESPONSE_FORMAT", "json_object")
+    monkeypatch.setenv("CI_OWNER_LLM_THINKING", "disabled")
+
+    model = OpenAICompatibleDiscoveryModel.from_env()
+
+    assert model.response_format_mode == "json_object"
+    assert model.thinking == "disabled"
+
+
+def test_openai_compatible_model_from_env_defaults_to_lm_studio_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CI_OWNER_LLM_BASE_URL", "http://localhost:1234/v1")
+    monkeypatch.setenv("CI_OWNER_LLM_API_KEY", "lm-studio")
+    monkeypatch.setenv("CI_OWNER_LLM_MODEL", "local-model")
+    monkeypatch.delenv("CI_OWNER_LLM_RESPONSE_FORMAT", raising=False)
+    monkeypatch.delenv("CI_OWNER_LLM_THINKING", raising=False)
+
+    model = OpenAICompatibleDiscoveryModel.from_env()
+
+    assert model.response_format_mode == "json_schema"
+    assert model.thinking is None
 
 
 def test_openai_compatible_model_classifies_invalid_structured_output() -> None:
